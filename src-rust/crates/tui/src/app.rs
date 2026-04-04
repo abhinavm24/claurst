@@ -215,20 +215,23 @@ pub struct ContextMenuState {
     pub y: u16,
     /// Currently selected menu item index (0-based).
     pub selected_index: usize,
+    /// What the context menu is acting on.
+    pub kind: ContextMenuKind,
+}
+
+/// What content the context menu is currently targeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextMenuKind {
+    /// A specific transcript message.
+    Message { message_index: usize },
+    /// The current text selection anywhere in the frame.
+    Selection,
 }
 
 /// Available context menu items.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextMenuItem {
     Copy,
-    CopyAsMarkdown,
-    CopyAsPlaintext,
-    CopyCodeBlocks,
-    CopyAsJson,
-    Paste,
-    Cut,
-    SelectAll,
-    Clear,
     Fork,
 }
 
@@ -697,12 +700,16 @@ pub struct App {
     pub thinking_expanded: std::collections::HashSet<u64>,
     /// The message pane area from the last render frame (used for mouse hit testing).
     pub last_msg_area: Cell<ratatui::layout::Rect>,
+    /// The frame region that supports text selection.
+    pub last_selectable_area: Cell<ratatui::layout::Rect>,
     /// The prompt input area from the last render frame (used for focus routing).
     pub last_input_area: Cell<ratatui::layout::Rect>,
     /// Which area of the TUI currently has keyboard focus.
     pub focus: FocusTarget,
     /// Maps virtual_row_index → thinking_block_hash for click detection.
     pub thinking_row_map: RefCell<std::collections::HashMap<u16, u64>>,
+    /// Maps screen row → transcript message index for right-click hit testing.
+    pub message_row_map: RefCell<std::collections::HashMap<u16, usize>>,
     /// Total message lines from the last render (used for virtual row mapping).
     pub total_message_lines: Cell<usize>,
     /// Scroll offset from the last render frame (used for selection validation).
@@ -1024,9 +1031,11 @@ impl App {
             agent_type_badge: None,
             thinking_expanded: std::collections::HashSet::new(),
             last_msg_area: Cell::new(ratatui::layout::Rect::default()),
+            last_selectable_area: Cell::new(ratatui::layout::Rect::default()),
             last_input_area: Cell::new(ratatui::layout::Rect::default()),
             focus: FocusTarget::Input,
             thinking_row_map: RefCell::new(std::collections::HashMap::new()),
+            message_row_map: RefCell::new(std::collections::HashMap::new()),
             total_message_lines: Cell::new(0),
             last_render_scroll_offset: Cell::new(0),
             selection_anchor: None,
@@ -3754,9 +3763,9 @@ impl App {
     /// Returns (start_row, end_row) for the line.
     #[allow(dead_code)]
     fn find_line_boundaries(&self, row: u16) -> Option<(u16, u16)> {
-        let msg_area = self.last_msg_area.get();
-        let line_start = msg_area.y;
-        let line_end = msg_area.y.saturating_add(msg_area.height).saturating_sub(1);
+        let selectable_area = self.last_selectable_area.get();
+        let line_start = selectable_area.y;
+        let line_end = selectable_area.y.saturating_add(selectable_area.height).saturating_sub(1);
 
         if row >= line_start && row <= line_end {
             Some((row, row))
@@ -3765,12 +3774,30 @@ impl App {
         }
     }
 
+    fn context_menu_items(kind: ContextMenuKind) -> &'static [ContextMenuItem] {
+        match kind {
+            ContextMenuKind::Message { .. } => &[ContextMenuItem::Copy, ContextMenuItem::Fork],
+            ContextMenuKind::Selection => &[ContextMenuItem::Copy],
+        }
+    }
+
+    fn message_index_at_row(&self, row: u16) -> Option<usize> {
+        self.message_row_map.borrow().get(&row).copied()
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.selection_focus = None;
+        *self.selection_text.borrow_mut() = String::new();
+    }
+
     /// Show context menu at the given position.
-    fn show_context_menu(&mut self, x: u16, y: u16) {
+    fn show_context_menu(&mut self, x: u16, y: u16, kind: ContextMenuKind) {
         self.context_menu_state = Some(ContextMenuState {
             x,
             y,
             selected_index: 0,
+            kind,
         });
     }
 
@@ -3782,8 +3809,7 @@ impl App {
     /// Handle context menu navigation with arrow keys.
     fn navigate_context_menu(&mut self, direction: KeyCode) {
         if let Some(mut menu) = self.context_menu_state {
-            // Copy (4 variants) + Paste, Cut, Select All, Clear, Fork = 10 items
-            let item_count = 10;
+            let item_count = Self::context_menu_items(menu.kind).len();
             match direction {
                 KeyCode::Up => {
                     menu.selected_index = menu.selected_index.saturating_sub(1);
@@ -3800,33 +3826,36 @@ impl App {
     /// Execute the currently selected context menu item.
     fn execute_context_menu_item(&mut self) {
         if let Some(menu) = self.context_menu_state {
-            let items = [
-                ContextMenuItem::Copy,
-                ContextMenuItem::CopyAsMarkdown,
-                ContextMenuItem::CopyAsPlaintext,
-                ContextMenuItem::CopyCodeBlocks,
-                ContextMenuItem::CopyAsJson,
-                ContextMenuItem::Paste,
-                ContextMenuItem::Cut,
-                ContextMenuItem::SelectAll,
-                ContextMenuItem::Clear,
-                ContextMenuItem::Fork,
-            ];
+            let items = Self::context_menu_items(menu.kind);
 
             if menu.selected_index < items.len() {
                 let item = items[menu.selected_index];
-                self.handle_context_menu_action(item);
+                self.handle_context_menu_action(item, menu.kind);
             }
         }
         self.dismiss_context_menu();
     }
 
     /// Handle a context menu action.
-    fn handle_context_menu_action(&mut self, item: ContextMenuItem) {
+    fn handle_context_menu_action(&mut self, item: ContextMenuItem, kind: ContextMenuKind) {
         match item {
             ContextMenuItem::Copy => {
-                let text = self.selection_text.borrow();
-                if !text.is_empty() {
+                let text = match kind {
+                    ContextMenuKind::Message { message_index } => self
+                        .messages
+                        .get(message_index)
+                        .map(|message| message.get_all_text()),
+                    ContextMenuKind::Selection => {
+                        let selected = self.selection_text.borrow().trim().to_string();
+                        if selected.is_empty() {
+                            None
+                        } else {
+                            Some(selected)
+                        }
+                    }
+                };
+
+                if let Some(text) = text {
                     if crate::message_copy::copy_to_clipboard(&text) {
                         self.notifications.push(
                             NotificationKind::Info,
@@ -3843,116 +3872,13 @@ impl App {
                     debug!("Copy action triggered, text: {} chars", text.len());
                 }
             }
-            ContextMenuItem::CopyAsMarkdown => {
-                if let Some(msg) = self.messages.last() {
-                    let markdown = crate::message_copy::copy_as_markdown(msg);
-                    if crate::message_copy::copy_to_clipboard(&markdown) {
-                        self.notifications.push(
-                            NotificationKind::Info,
-                            "Copied as Markdown.".to_string(),
-                            Some(3),
-                        );
-                    } else {
-                        self.notifications.push(
-                            NotificationKind::Warning,
-                            "Failed to copy to clipboard.".to_string(),
-                            Some(3),
-                        );
-                    }
-                }
-            }
-            ContextMenuItem::CopyAsPlaintext => {
-                if let Some(msg) = self.messages.last() {
-                    let plaintext = crate::message_copy::copy_as_plaintext(msg);
-                    if crate::message_copy::copy_to_clipboard(&plaintext) {
-                        self.notifications.push(
-                            NotificationKind::Info,
-                            "Copied as plaintext.".to_string(),
-                            Some(3),
-                        );
-                    } else {
-                        self.notifications.push(
-                            NotificationKind::Warning,
-                            "Failed to copy to clipboard.".to_string(),
-                            Some(3),
-                        );
-                    }
-                }
-            }
-            ContextMenuItem::CopyCodeBlocks => {
-                if let Some(msg) = self.messages.last() {
-                    let code = crate::message_copy::copy_code_blocks(msg);
-                    if crate::message_copy::copy_to_clipboard(&code) {
-                        self.notifications.push(
-                            NotificationKind::Info,
-                            "Copied code blocks.".to_string(),
-                            Some(3),
-                        );
-                    } else {
-                        self.notifications.push(
-                            NotificationKind::Warning,
-                            "Failed to copy to clipboard.".to_string(),
-                            Some(3),
-                        );
-                    }
-                }
-            }
-            ContextMenuItem::CopyAsJson => {
-                if let Some(msg) = self.messages.last() {
-                    let json = crate::message_copy::copy_as_json(msg);
-                    if crate::message_copy::copy_to_clipboard(&json) {
-                        self.notifications.push(
-                            NotificationKind::Info,
-                            "Copied as JSON.".to_string(),
-                            Some(3),
-                        );
-                    } else {
-                        self.notifications.push(
-                            NotificationKind::Warning,
-                            "Failed to copy to clipboard.".to_string(),
-                            Some(3),
-                        );
-                    }
-                }
-            }
-            ContextMenuItem::Paste => {
-                debug!("Paste action triggered");
-            }
-            ContextMenuItem::Cut => {
-                let text = self.selection_text.borrow();
-                if !text.is_empty() {
-                    if crate::message_copy::copy_to_clipboard(&text) {
-                        self.notifications.push(
-                            NotificationKind::Info,
-                            "Cut to clipboard.".to_string(),
-                            Some(3),
-                        );
-                    }
-                    debug!("Cut action triggered, text: {} chars", text.len());
-                    self.selection_anchor = None;
-                    self.selection_focus = None;
-                }
-            }
-            ContextMenuItem::SelectAll => {
-                // Select all messages in the message pane
-                let msg_area = self.last_msg_area.get();
-                self.selection_anchor = Some((msg_area.x, msg_area.y));
-                self.selection_focus = Some((
-                    msg_area.x.saturating_add(msg_area.width).saturating_sub(1),
-                    msg_area.y.saturating_add(msg_area.height).saturating_sub(1),
-                ));
-            }
-            ContextMenuItem::Clear => {
-                self.selection_anchor = None;
-                self.selection_focus = None;
-                *self.selection_text.borrow_mut() = String::new();
-            }
             ContextMenuItem::Fork => {
-                // Fork from the current point in the conversation.
-                // Put /fork in the input so the user can execute it.
-                let msg_count = self.messages.len();
-                self.prompt_input.replace_text(format!("/fork {}", msg_count));
-                self.status_message = Some(format!("Fork at message {} - press Enter to confirm", msg_count));
+                if let ContextMenuKind::Message { message_index } = kind {
+                    let branch_point = message_index + 1;
+                    self.prompt_input.replace_text(format!("/fork {}", branch_point));
+                    self.status_message =
+                        Some(format!("Fork at message {} - press Enter to confirm", branch_point));
+                }
             }
         }
     }
@@ -3968,10 +3894,10 @@ impl App {
         }
 
         // ---- Dialog interaction: dismiss on click-outside, scroll/click inside ----
+        // Key-input and device-auth stay outside this gate so their visible text
+        // can still be selected and copied with the mouse.
         let any_dialog = self.connect_dialog.visible
             || self.command_palette.visible
-            || self.key_input_dialog.visible
-            || self.device_auth_dialog.visible
             || self.model_picker.visible
             || self.export_dialog.visible
             || self.settings_screen.visible
@@ -3982,11 +3908,6 @@ impl App {
         if any_dialog {
             match mouse_event.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
-                    // Modal dialogs (device auth, key input) — absorb ALL clicks, never dismiss
-                    if self.device_auth_dialog.visible || self.key_input_dialog.visible {
-                        return; // Modal — only Esc or completion can close these
-                    }
-
                     // DialogSelect dialogs — check if click is inside for item selection
                     let in_dialog = if self.connect_dialog.visible {
                         self.connect_dialog.contains(mouse_event.column, mouse_event.row)
@@ -4050,11 +3971,29 @@ impl App {
             // ---- Right-click context menu ----------------------------------
             MouseEventKind::Down(MouseButton::Right) => {
                 let msg_area = self.last_msg_area.get();
+                let has_selection = !self.selection_text.borrow().trim().is_empty();
                 if mouse_event.column >= msg_area.x
                     && mouse_event.column < msg_area.x.saturating_add(msg_area.width)
                     && mouse_event.row >= msg_area.y
-                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height) {
-                    self.show_context_menu(mouse_event.column, mouse_event.row);
+                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height)
+                {
+                    if let Some(message_index) = self.message_index_at_row(mouse_event.row) {
+                        self.show_context_menu(
+                            mouse_event.column,
+                            mouse_event.row,
+                            ContextMenuKind::Message { message_index },
+                        );
+                    } else {
+                        self.dismiss_context_menu();
+                    }
+                } else if has_selection {
+                    self.show_context_menu(
+                        mouse_event.column,
+                        mouse_event.row,
+                        ContextMenuKind::Selection,
+                    );
+                } else {
+                    self.dismiss_context_menu();
                 }
             }
 
@@ -4064,7 +4003,7 @@ impl App {
                 self.dismiss_context_menu();
 
                 let input_area = self.last_input_area.get();
-                let msg_area = self.last_msg_area.get();
+                let selectable_area = self.last_selectable_area.get();
 
                 let in_input = input_area.width > 0 && input_area.height > 0
                     && mouse_event.row >= input_area.y
@@ -4072,21 +4011,18 @@ impl App {
                     && mouse_event.column >= input_area.x
                     && mouse_event.column < input_area.x.saturating_add(input_area.width);
 
-                let in_messages = msg_area.width > 0 && msg_area.height > 0
-                    && mouse_event.row >= msg_area.y
-                    && mouse_event.row < msg_area.y.saturating_add(msg_area.height)
-                    && mouse_event.column >= msg_area.x
-                    && mouse_event.column < msg_area.x.saturating_add(msg_area.width);
+                let in_selectable = selectable_area.width > 0 && selectable_area.height > 0
+                    && mouse_event.row >= selectable_area.y
+                    && mouse_event.row < selectable_area.y.saturating_add(selectable_area.height)
+                    && mouse_event.column >= selectable_area.x
+                    && mouse_event.column < selectable_area.x.saturating_add(selectable_area.width);
 
                 if in_input {
                     self.focus = FocusTarget::Input;
-                    // Clear any message selection
-                    self.selection_anchor = None;
-                    self.selection_focus = None;
-                } else if msg_area.width == 0 || msg_area.height == 0 {
-                    // Message area not initialized yet
+                    self.clear_selection();
+                } else if selectable_area.width == 0 || selectable_area.height == 0 {
                     self.click_count = 0;
-                } else if in_messages {
+                } else if in_selectable {
                     self.focus = FocusTarget::Transcript;
 
                     let current_pos = (mouse_event.column, mouse_event.row);
@@ -4097,9 +4033,12 @@ impl App {
                         self.click_count += 1;
                         if self.click_count >= 3 {
                             // Triple-click: select entire line
-                            self.selection_anchor = Some((msg_area.x, current_pos.1));
+                            self.selection_anchor = Some((selectable_area.x, current_pos.1));
                             self.selection_focus = Some((
-                                msg_area.x.saturating_add(msg_area.width).saturating_sub(1),
+                                selectable_area
+                                    .x
+                                    .saturating_add(selectable_area.width)
+                                    .saturating_sub(1),
                                 current_pos.1,
                             ));
                             self.click_count = 0; // Reset for next click sequence
@@ -4121,27 +4060,25 @@ impl App {
                     self.last_click_time = Some(now);
                     self.last_click_position = Some(current_pos);
                 } else {
-                    // Click outside message area resets click count and selection
                     self.click_count = 0;
-                    self.selection_anchor = None;
-                    self.selection_focus = None;
+                    self.clear_selection();
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
                 // Dismiss context menu on drag
                 self.dismiss_context_menu();
 
-                // Continue drag — clamp to message pane bounds so dragging
+                // Continue drag — clamp to the selectable frame bounds so dragging
                 // outside extends selection to the edge rather than cancelling.
                 if self.selection_anchor.is_some() {
-                    let msg_area = self.last_msg_area.get();
-                    if msg_area.width > 0 && msg_area.height > 0 {
+                    let selectable_area = self.last_selectable_area.get();
+                    if selectable_area.width > 0 && selectable_area.height > 0 {
                         let clamped_col = mouse_event.column
-                            .max(msg_area.x)
-                            .min(msg_area.x.saturating_add(msg_area.width).saturating_sub(1));
+                            .max(selectable_area.x)
+                            .min(selectable_area.x.saturating_add(selectable_area.width).saturating_sub(1));
                         let clamped_row = mouse_event.row
-                            .max(msg_area.y)
-                            .min(msg_area.y.saturating_add(msg_area.height).saturating_sub(1));
+                            .max(selectable_area.y)
+                            .min(selectable_area.y.saturating_add(selectable_area.height).saturating_sub(1));
                         self.selection_focus = Some((clamped_col, clamped_row));
                         self.click_count = 0; // Reset on drag to prevent further double-clicks
                     }
@@ -4150,8 +4087,7 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 // Clear if no actual drag (single click = no selection)
                 if self.selection_anchor == self.selection_focus {
-                    self.selection_anchor = None;
-                    self.selection_focus = None;
+                    self.clear_selection();
                 }
             }
             _ => {}
@@ -4681,6 +4617,54 @@ mod tests {
         assert_eq!(app.output_style, "verbose");
         assert!(app.intercept_slash_command("output-style"));
         assert_eq!(app.output_style, "auto");
+    }
+
+    #[test]
+    fn test_context_menu_fork_targets_clicked_message() {
+        let mut app = make_app();
+        app.add_message(Role::User, "one".to_string());
+        app.add_message(Role::Assistant, "two".to_string());
+        app.add_message(Role::User, "three".to_string());
+
+        app.handle_context_menu_action(
+            ContextMenuItem::Fork,
+            ContextMenuKind::Message { message_index: 1 },
+        );
+
+        assert_eq!(app.prompt_input.text, "/fork 2");
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("Fork at message 2 - press Enter to confirm")
+        );
+    }
+
+    #[test]
+    fn test_right_click_targets_row_message_instead_of_last_message() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+        let mut app = make_app();
+        app.last_msg_area.set(ratatui::layout::Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        });
+        app.message_row_map.borrow_mut().insert(3, 1);
+
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 12,
+            row: 3,
+            modifiers: KeyModifiers::empty(),
+        });
+
+        assert!(matches!(
+            app.context_menu_state,
+            Some(ContextMenuState {
+                kind: ContextMenuKind::Message { message_index: 1 },
+                ..
+            })
+        ));
     }
 
     // ---- Help overlay -------------------------------------------------------

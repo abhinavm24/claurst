@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use crate::agents_view::render_agents_menu;
 use crate::context_viz::render_context_viz;
 use crate::export_dialog::render_export_dialog;
-use crate::app::{App, SystemAnnotation, SystemMessageStyle, ToolStatus};
+use crate::app::{App, ContextMenuKind, SystemAnnotation, SystemMessageStyle, ToolStatus};
 use crate::rustle::{rustle_lines, RustlePose};
 use crate::diff_viewer::render_diff_dialog;
 use crate::model_picker::render_model_picker;
@@ -297,6 +297,7 @@ struct RenderedLineItem {
     line: Line<'static>,
     search_text: String,
     is_header: bool,
+    message_index: Option<usize>,
 }
 
 impl VirtualItem for RenderedLineItem {
@@ -369,6 +370,7 @@ thread_local! {
 /// Render the entire application into the current frame.
 pub fn render_app(frame: &mut Frame, app: &App) {
     let size = frame.area();
+    app.last_selectable_area.set(size);
 
     // Fill the entire frame with a black background so the terminal's default
     // color (blue on Windows) doesn't bleed through cells not covered by widgets.
@@ -626,12 +628,8 @@ pub fn render_app(frame: &mut Frame, app: &App) {
     }
 
     // ---- Text selection highlight (topmost post-pass) ---------------------
-    // Only show selection when no full-screen modal overlay is active.
-    if !modal_active {
-        apply_selection_highlight(frame, app);
-        // Render context menu on top of selection
-        render_context_menu(frame, app);
-    }
+    apply_selection_highlight(frame, app);
+    render_context_menu(frame, app);
 }
 
 /// Post-render pass: invert colours on selected cells and extract the
@@ -645,30 +643,37 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
         return;
     }
 
-    // Restrict selection to message pane area only
-    let msg_area = app.last_msg_area.get();
-
-    // Validate selection is within message area bounds
-    if anchor.0 < msg_area.x
-        || anchor.0 >= msg_area.x.saturating_add(msg_area.width)
-        || anchor.1 < msg_area.y
-        || anchor.1 >= msg_area.y.saturating_add(msg_area.height)
-    {
-        // Anchor is outside message area — clear selection
+    let selectable_area = app.last_selectable_area.get();
+    if selectable_area.width == 0 || selectable_area.height == 0 {
         return;
     }
 
-    let msg_max_row = msg_area.y.saturating_add(msg_area.height).saturating_sub(1);
-    let msg_max_col = msg_area.x.saturating_add(msg_area.width).saturating_sub(1);
+    // Validate selection is within selectable bounds
+    if anchor.0 < selectable_area.x
+        || anchor.0 >= selectable_area.x.saturating_add(selectable_area.width)
+        || anchor.1 < selectable_area.y
+        || anchor.1 >= selectable_area.y.saturating_add(selectable_area.height)
+    {
+        return;
+    }
 
-    // Clamp anchor and focus to message pane bounds
+    let max_row = selectable_area
+        .y
+        .saturating_add(selectable_area.height)
+        .saturating_sub(1);
+    let max_col = selectable_area
+        .x
+        .saturating_add(selectable_area.width)
+        .saturating_sub(1);
+
+    // Clamp anchor and focus to selectable bounds
     let anchor = (
-        anchor.0.clamp(msg_area.x, msg_max_col),
-        anchor.1.clamp(msg_area.y, msg_max_row),
+        anchor.0.clamp(selectable_area.x, max_col),
+        anchor.1.clamp(selectable_area.y, max_row),
     );
     let focus = (
-        focus.0.clamp(msg_area.x, msg_max_col),
-        focus.1.clamp(msg_area.y, msg_max_row),
+        focus.0.clamp(selectable_area.x, max_col),
+        focus.1.clamp(selectable_area.y, max_row),
     );
 
     // Normalise so start ≤ end (row-major order).
@@ -680,10 +685,10 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
 
     let buf = frame.buffer_mut();
     let mut text = String::new();
-    let last_row = end.1.min(msg_max_row);
+    let last_row = end.1.min(max_row);
     for row in start.1..=last_row {
-        let col_from = if row == start.1 { start.0 } else { msg_area.x };
-        let col_to = if row == end.1 { end.0 } else { msg_max_col };
+        let col_from = if row == start.1 { start.0 } else { selectable_area.x };
+        let col_to = if row == end.1 { end.0 } else { max_col };
         for col in col_from..=col_to {
             if let Some(cell) = buf.cell_mut((col, row)) {
                 let sym = cell.symbol().to_owned();
@@ -708,21 +713,22 @@ fn apply_selection_highlight(frame: &mut Frame, app: &App) {
 /// Render a right-click context menu at the specified position.
 fn render_context_menu(frame: &mut Frame, app: &App) {
     if let Some(menu) = app.context_menu_state {
-        let items = [
-            ("Copy", !app.selection_text.borrow().is_empty()),
-            ("Copy as MD", !app.messages.is_empty()),
-            ("Copy Plain", !app.messages.is_empty()),
-            ("Copy Code", !app.messages.is_empty()),
-            ("Copy JSON", !app.messages.is_empty()),
-            ("Paste", true),
-            ("Cut", !app.selection_text.borrow().is_empty()),
-            ("Select All", true),
-            ("Clear", app.selection_anchor.is_some()),
-            ("Fork here", !app.messages.is_empty()),
-        ];
+        let selection_present = !app.selection_text.borrow().trim().is_empty();
+        let items: Vec<(&str, bool)> = match menu.kind {
+            ContextMenuKind::Message { message_index } => vec![
+                ("Copy", app.messages.get(message_index).is_some()),
+                ("Fork new chat", app.messages.get(message_index).is_some()),
+            ],
+            ContextMenuKind::Selection => vec![("Copy", selection_present)],
+        };
 
-        let menu_height = (items.len() as u16).min(15); // Limit to 15 items max
-        let menu_width = 16; // Increased width for longer labels
+        let menu_height = (items.len() as u16).saturating_add(2);
+        let menu_width = items
+            .iter()
+            .map(|(label, _)| label.len())
+            .max()
+            .unwrap_or(4)
+            .saturating_add(4) as u16;
 
         // Clamp menu position to screen bounds
         let screen = frame.area();
@@ -740,7 +746,8 @@ fn render_context_menu(frame: &mut Frame, app: &App) {
         let menu_block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .style(Style::default().fg(Color::White).bg(Color::DarkGray));
+            .style(Style::default().fg(Color::White).bg(Color::Rgb(24, 24, 30)))
+            .border_style(Style::default().fg(CLAURST_ACCENT));
         menu_block.render(menu_area, frame.buffer_mut());
 
         // Render menu items
@@ -762,17 +769,18 @@ fn render_context_menu(frame: &mut Frame, app: &App) {
             let fg_color = if *enabled {
                 if is_selected { Color::Black } else { Color::White }
             } else {
-                Color::Gray // Disabled items appear grayed
-            };
-
-            let bg_color = if is_selected {
-                if *enabled { Color::Cyan } else { Color::DarkGray }
-            } else {
                 Color::DarkGray
             };
 
+            let bg_color = if is_selected {
+                if *enabled { CLAURST_ACCENT } else { Color::Rgb(24, 24, 30) }
+            } else {
+                Color::Rgb(24, 24, 30)
+            };
+
             let style = Style::default().fg(fg_color).bg(bg_color);
-            let padded_label = format!(" {:<12} ", label);
+            let padded_label =
+                format!(" {:<width$} ", label, width = menu_width.saturating_sub(2) as usize);
 
             if let Some(cell) = frame.buffer_mut().cell_mut((inner.x, y)) {
                 cell.set_symbol(&padded_label[0..1.min(padded_label.len())]);
@@ -849,6 +857,8 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
             render_startup_notices(frame, app, na);
         }
     } else if app.messages.is_empty() && app.streaming_text.is_empty() {
+        app.last_msg_area.set(Rect::default());
+        app.message_row_map.borrow_mut().clear();
         render_welcome_box(frame, app, content_area);
         return;
     }
@@ -896,6 +906,19 @@ fn render_messages(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         max_scroll.saturating_sub(app.scroll_offset)
     };
+
+    let visible_rows: std::collections::HashMap<u16, usize> = lines
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(msg_area.height as usize)
+        .filter_map(|(idx, item)| {
+            item.message_index.map(|message_index| {
+                (msg_area.y.saturating_add((idx.saturating_sub(scroll)) as u16), message_index)
+            })
+        })
+        .collect();
+    *app.message_row_map.borrow_mut() = visible_rows;
 
     // No border — messages render directly into the area.
     let mut list = VirtualList::new();
@@ -1001,11 +1024,16 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
         } else {
             let tool_names = build_tool_names(&app.messages);
             let mut raw: Vec<Line> = Vec::new();
+            let mut message_indices: Vec<Option<usize>> = Vec::new();
             let mut header_indices: std::collections::HashSet<usize> = std::collections::HashSet::new();
             let total = app.messages.len();
             for i in 0..=total {
                 for ann in app.system_annotations.iter().filter(|a| a.after_index == i) {
+                    let ann_start = raw.len();
                     render_system_annotation_lines(&mut raw, ann, width as usize);
+                    message_indices.extend(
+                        std::iter::repeat(None).take(raw.len().saturating_sub(ann_start)),
+                    );
                 }
                 if i < total {
                     // Mark the first line of each message as a section header
@@ -1014,6 +1042,9 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                     if raw.len() > msg_start {
                         header_indices.insert(msg_start);
                     }
+                    message_indices.extend(
+                        std::iter::repeat(Some(i)).take(raw.len().saturating_sub(msg_start)),
+                    );
                 }
             }
             let items: Vec<RenderedLineItem> = raw
@@ -1022,6 +1053,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
                 .map(|(idx, line)| RenderedLineItem {
                     search_text: flatten_line_text(&line),
                     is_header: header_indices.contains(&idx),
+                    message_index: message_indices.get(idx).copied().flatten(),
                     line,
                 })
                 .collect();
@@ -1075,6 +1107,7 @@ fn render_message_items(app: &App, width: u16) -> Vec<RenderedLineItem> {
     items.extend(live.into_iter().map(|line| RenderedLineItem {
         search_text: flatten_line_text(&line),
         is_header: false,
+        message_index: None,
         line,
     }));
     items
